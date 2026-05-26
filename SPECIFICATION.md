@@ -1,10 +1,16 @@
 # GILDOS — An AI-Native Operating System
 
-**Engineering Specification, Revision 0.1**
+**Engineering Specification, Revision 0.2**
 **Classification:** Internal / Exploratory Research
-**Date:** 2026-05-26
+**Date:** 2026-05-27
 **Editor:** Principal Systems Architecture Group
 **Status:** Draft for technical review. Not a product roadmap.
+
+**Revision 0.2 adds:**
+- §15 Target Hardware Profile (DGX Spark as Phase-1 reference platform)
+- §16 Testing and Development Strategy (VM/container ladder, external-model substitution, CI matrix)
+- §17 Prerequisites (hardware, software, operational, organizational)
+- Renumbered Open Research Questions to §18.
 
 ---
 
@@ -36,7 +42,10 @@
 12. Storage and Persistence
 13. Networking
 14. Development Roadmap
-15. Open Research Questions
+15. Target Hardware Profile
+16. Testing and Development Strategy
+17. Prerequisites
+18. Open Research Questions
 
 ---
 
@@ -1490,11 +1499,552 @@ research-funded territory.
 
 ---
 
-## 15. Open Research Questions
+## 15. Target Hardware Profile
+
+This section binds the otherwise architecture-agnostic specification to a
+**concrete first-target machine** so Phase-1 engineering has a stable
+substrate. Gildos remains portable in principle; in practice, every
+component below MUST run, be measured on, and pass acceptance gates
+against this reference platform before being declared "done."
+
+### 15.1 Primary Reference: NVIDIA DGX Spark (ARM64 / Grace-Blackwell)
+
+The Phase-1 reference platform is the **NVIDIA DGX Spark**, a desktop-class
+AI workstation built on the GB10 Grace-Blackwell Superchip. It is chosen
+for one reason: it is the smallest commercially available machine that can
+**hold a useful resident model in coherent CPU+GPU memory** without
+network-attached accelerators.
+
+| Property                | Value (reference)                                  |
+|-------------------------|----------------------------------------------------|
+| SoC                     | NVIDIA GB10 Grace-Blackwell Superchip              |
+| CPU                     | 20-core ARMv9 (Cortex-X925 + Cortex-A725 class)    |
+| ISA                     | `aarch64` (ARMv9-A, SVE2, BF16, FP16, INT8)        |
+| GPU                     | Blackwell-class, 5th-gen Tensor Cores, FP4 support |
+| Unified memory          | 128 GB LPDDR5x, CPU+GPU coherent                   |
+| Storage                 | NVMe SSD (multi-TB class)                          |
+| High-speed fabric       | ConnectX-class NIC (clusterable, 2-node typical)   |
+| Power envelope          | Desktop-class (~150–250 W typical)                 |
+| Host OS (stock)         | DGX OS (Ubuntu-derived) + CUDA                     |
+| Bootloader              | UEFI (ARM)                                         |
+| Secure boot             | Supported (vendor chain)                           |
+
+Numbers SHOULD be treated as nominal; the canonical values for any given
+hardware revision MUST come from a `hwprobe` capability run on the actual
+device (see §16.4). The spec MUST NOT hardcode them.
+
+### 15.2 Why DGX Spark (and not a workstation GPU)
+
+- **Unified memory.** A coherent CPU+GPU 128 GB pool removes the
+  hardest Phase-1 ergonomics problem: VRAM eviction policies. Tier B/C
+  in §10 can be deferred while a Tier-A-only configuration still fits a
+  ~70B Q4 model with headroom.
+- **ARM64 from day one.** This forces the build system, kernel modules,
+  capability ABI, and event extractors to be portable *immediately*,
+  rather than discovering ARM regressions in Phase 3.
+- **Single-vendor stack.** CUDA, drivers, NCCL, and BlueField networking
+  are integrated. Reduces driver-yak-shaving in early engineering.
+- **Plausible deployment target.** A DGX Spark is the smallest unit
+  that resembles a real "personal AI appliance." Optimizing for it
+  is closer to the product thesis than optimizing for a multi-rack node.
+
+### 15.3 Tradeoffs and Caveats
+
+- **Closed firmware / proprietary GPU stack.** Phase-4 ambitions
+  ("independent kernel/runtime") are *constrained* by the availability
+  of NVIDIA's open kernel modules and CUDA-equivalent userspace. Gildos
+  MUST NOT assume Phase 4 can ship on this hardware without vendor
+  cooperation or migration to alternative accelerators.
+- **ARM ecosystem gaps.** Some sandboxing tools (e.g., gVisor on
+  certain syscalls, specific Firecracker features) lag x86_64. The
+  build matrix MUST test ARM64 as the primary target and x86_64 as the
+  secondary, not the reverse.
+- **Cost and availability.** DGX Spark is not a hobbyist machine.
+  Phase-1 contributors will mostly develop on §15.4 surrogates and only
+  validate on Spark for milestone sign-off.
+- **Thermal envelope.** Continuous inference at full duty cycle will
+  push the chassis to its thermal limit. §10's thermal supervisor is a
+  hard requirement, not a nice-to-have.
+
+### 15.4 Secondary Reference Platforms
+
+Engineering MUST keep at least the following alive in CI to avoid
+single-platform lock-in:
+
+| Tier | Platform                              | Purpose                            |
+|------|---------------------------------------|------------------------------------|
+| R0   | DGX Spark (ARM64 + Blackwell)         | Acceptance / milestone gating      |
+| R1   | Apple Silicon (M3/M4, MLX or CPU GGUF)| ARM64 portability, no CUDA         |
+| R2   | x86_64 workstation + RTX 4090/5090    | x86 portability, CUDA on consumer  |
+| R3   | x86_64 CPU-only laptop                | Capability tests w/o GPU; CI       |
+| R4   | Raspberry Pi 5 (ARM64, CPU GGUF tiny) | Minimal-resource sanity            |
+
+R3 and R4 will use small models (e.g., 1–3B parameters) and are not
+expected to be performant; they exist so that the **non-cognitive**
+subsystems (eventd, capd, memd, supervisord) cannot quietly grow a
+hard CUDA dependency.
+
+### 15.5 Hardware Abstraction Implications
+
+To survive the matrix above, the cognitive runtime MUST present a
+**backend-agnostic inference interface**. Concretely:
+
+```
++-------------------------------------------------------+
+|             cogd / engine wrapper                     |
+|  - load(model_uri, backend_hint) -> handle            |
+|  - generate(handle, prompt, grammar, kv) -> tokens    |
+|  - snapshot(handle) / restore(handle, blob)           |
++----+--------------------+--------------------+--------+
+     |                    |                    |
+     v                    v                    v
++----+----+         +-----+----+         +-----+----+
+| llama.  |         |   MLX    |         |  vLLM    |
+| cpp     |         | (Apple)  |         | (CUDA)   |
+| (CPU/   |         |          |         |          |
+|  CUDA/  |         |          |         |          |
+|  Metal) |         |          |         |          |
++---------+         +----------+         +----------+
+```
+
+Backend selection is a runtime decision driven by `hwprobe`. No
+capability above `cogd` may import a backend SDK directly.
+
+---
+
+## 16. Testing and Development Strategy
+
+The goal of this section is to make the system **buildable and testable
+without owning a DGX Spark**, while still ensuring the Spark is the
+authoritative target. We do this with a four-tier development ladder
+and an explicit policy for substituting the resident model with an
+external one during early development.
+
+### 16.1 The Four-Tier Development Ladder
+
+```
+ Tier 0: External-model harness     (laptop, no GPU, no model loaded)
+   |
+   v
+ Tier 1: Docker container           (Linux, optional GPU passthrough)
+   |
+   v
+ Tier 2: Virtual machine            (QEMU/KVM, optional vGPU; ARM64 emulated or native)
+   |
+   v
+ Tier 3: Bare-metal reference       (DGX Spark or R1/R2 from §15.4)
+```
+
+Each tier exists to catch a different class of bug cheaply. A change
+SHOULD pass Tier 0–1 before being proposed for review and MUST pass
+Tier 2 before merge to `main`. Tier 3 is gated by milestone, not per
+commit, because Spark time is scarce.
+
+### 16.2 Tier 0 — External-Model Harness
+
+**Purpose.** Develop and test everything *except* the inference engine
+itself: schemas, capabilities, the event bus, the supervisor, the
+sandbox, audit logging, the gateway, the recovery loop.
+
+**Mechanism.** `cogd` exposes a stable interface (see §15.5). For
+Tier 0 we ship a **MockEngine** and a **RemoteEngine**:
+
+- **MockEngine.** Returns deterministic, schema-conforming responses
+  driven by a recorded transcript or a small rule table. Used in unit
+  tests and CI. No network, no model.
+- **RemoteEngine.** Forwards `generate(...)` to an **external API**
+  (Anthropic / OpenAI / a self-hosted server / a peer Gildos node) over
+  a hardened adapter. The adapter:
+  - enforces the same JSON-schema / grammar constraints locally before
+    accepting the response,
+  - strips the prompt of secrets per a redaction policy capability,
+  - records every call (prompt hash, response hash, latency, cost) into
+    the audit log,
+  - is **disabled by default in production builds** and must be
+    explicitly enabled by an operator-signed capability manifest.
+
+**Why this matters.** Most Phase-1 bugs are in plumbing: event
+extractors, sandbox escapes, capability lifecycle, the rollback loop.
+Iterating on those does not require running a 70B model on a developer's
+laptop. The external-model path turns a $5k machine into a `curl` call.
+
+**Limitations.**
+- Latency, token economics, and KV-cache behavior do not match the
+  resident model — never benchmark cognitive-runtime performance with
+  RemoteEngine.
+- Sending real user data to an external provider is a privacy boundary;
+  the Tier-0 harness MUST refuse to attach to a profile marked
+  `sensitivity >= confidential`.
+- Some constrained-decoding schemes are unavailable through hosted
+  APIs; tests that depend on logit-level grammar enforcement must run
+  on Tier 1+ with a local engine.
+
+**Hardware profile.** Any laptop with 16 GB RAM. No GPU required.
+
+### 16.3 Tier 1 — Docker Container
+
+**Purpose.** Exercise the full daemon set (`supervisord`, `eventd`,
+`capd`, `cogd`, `memd`, gateway) against a *local* inference engine,
+with reproducible builds.
+
+**Image layout.**
+
+```
+gildos/devstack:<arch>-<rev>
+  - ubuntu:24.04 (or distroless variant for prod images)
+  - llama.cpp built with CUDA / Metal / CPU per arch
+  - the seven Gildos daemons (statically linked or single-binary)
+  - capability cache pre-seeded with reference capabilities
+  - model volume mounted at /var/lib/gildos/models (NOT baked in)
+```
+
+**Runtime invocations.**
+
+```
+# CPU-only smoke
+docker run --rm -it \
+  -v $PWD/models:/var/lib/gildos/models:ro \
+  -v gildos-state:/var/lib/gildos \
+  -p 8443:8443 \
+  gildos/devstack:arm64-0.2 \
+  --engine=llama.cpp --backend=cpu --model=phi-3-mini-q4.gguf
+
+# CUDA passthrough (Linux + NVIDIA Container Toolkit)
+docker run --rm -it --gpus=all \
+  -v $PWD/models:/var/lib/gildos/models:ro \
+  gildos/devstack:amd64-0.2 \
+  --engine=llama.cpp --backend=cuda --model=llama-3-70b-q4.gguf
+```
+
+**Compose profile** for the full stack including a tester:
+
+```
+services:
+  gildos:
+    image: gildos/devstack:arm64-0.2
+    deploy: { resources: { reservations: { devices: [ ... gpus ... ] } } }
+    volumes: [ "./models:/var/lib/gildos/models:ro", "gildos:/var/lib/gildos" ]
+    ports: [ "8443:8443" ]
+  tester:
+    image: gildos/conformance:0.2
+    depends_on: [ gildos ]
+    command: ["pytest", "-q", "conformance/"]
+```
+
+**Caveats.**
+- Containers share the host kernel; tests that exercise kernel
+  surfaces (e.g., the `eventd` netlink extractor, cgroup
+  observability) MUST be moved to Tier 2.
+- Container GPU passthrough hides certain failure modes (driver
+  reset, OOM-kill of resident model). Tier 2 reproduces them.
+
+### 16.4 Tier 2 — Virtual Machine
+
+**Purpose.** Exercise the boot chain (§4), the supervisor's claim on
+PID 1, the recovery boot path, the read-only root, and ARM64-specific
+code on systems that aren't ARM.
+
+**Configurations.**
+
+| Host arch | VM arch | Mechanism                              | GPU                |
+|-----------|---------|----------------------------------------|--------------------|
+| x86_64    | ARM64   | QEMU TCG (slow) or QEMU + KVM via foreign-arch | none (CPU-only) |
+| ARM64     | ARM64   | QEMU + KVM (native speed)              | passthrough vfio   |
+| x86_64    | x86_64  | QEMU + KVM                             | vfio passthrough   |
+
+A reference cloud-init image SHOULD be produced per arch
+(`gildos-base-aarch64.qcow2`, `gildos-base-amd64.qcow2`) containing
+the minimal runtime, supervisord as PID 1, and a serial console hook
+into the AI gateway. Boot time, recovery boot, and KV snapshot/restore
+are validated here.
+
+The VM is the **only tier where the full boot chain (UEFI → bootloader →
+kernel → supervisord → cogd → ready) is exercised end-to-end without
+hardware risk.** Every change touching §4 MUST cross this tier.
+
+### 16.5 Tier 3 — Bare-Metal Reference (DGX Spark, etc.)
+
+**Purpose.** Acceptance and benchmark gating. No development happens
+here directly; only signed candidate builds are deployed.
+
+**Workflow.**
+
+1. CI produces an artifact bundle (kernel modules, daemons,
+   capability cache, signed manifest).
+2. A `deployd` capability on the Spark verifies the signature, takes a
+   snapshot of the current root and capability cache, and atomically
+   switches.
+3. Benchmark and conformance suites run with the resident 70B model.
+4. Results (latency histograms, tokens/sec, KV hit rate, thermal
+   trace, audit log) are pushed back to the CI dashboard.
+5. Pass/fail against §10 and §14 milestone gates is automatic;
+   regressions trigger automatic rollback.
+
+A `hwprobe` capability emits a normalized hardware-profile JSON used by
+the cognitive runtime to pick backends, set residency tiers, and
+configure the thermal supervisor. This is the **only authoritative
+source** for "what hardware are we on" — no hardcoding.
+
+```
+{
+  "profile_version": 1,
+  "host": "spark-dev-01",
+  "cpu":   { "isa": "aarch64", "cores": 20, "features": ["sve2","bf16"] },
+  "gpu":   { "vendor": "nvidia", "arch": "blackwell",
+             "tensor_cores": true, "fp4": true,
+             "vram_mb": 122880, "uma": true },
+  "ram_mb": 131072,
+  "nic":   [{ "name": "cx7-0", "speed_gbps": 200 }],
+  "thermal": { "sensors": ["cpu_pkg","gpu","ssd"], "throttle_c": 95 }
+}
+```
+
+### 16.6 Test Types
+
+| Type                  | Tier(s) | What it proves                                |
+|-----------------------|---------|-----------------------------------------------|
+| Unit                  | 0       | Function-level correctness                    |
+| Schema / conformance  | 0–1     | Event and capability ABI stability            |
+| Integration           | 1       | Daemon-to-daemon contracts                    |
+| Boot / lifecycle      | 2       | §4 paths including recovery boot              |
+| Capability rollout    | 1–2     | Propose → canary → adopt → rollback           |
+| Sandbox escape        | 1–2     | Negative tests against §7/§11                 |
+| Cognitive regression  | 1–3     | Constrained-decoding correctness, refusals    |
+| Adversarial / prompt  | 0–3     | §11 attack catalog                            |
+| Performance / thermal | 3       | Tokens/sec, p99 latency, throttling behavior  |
+| Soak (72 h)           | 3       | Memory leaks, KV fragmentation, drift         |
+| Self-improvement loop | 2–3     | §9 convergence and rollback                   |
+
+A change is "done" when its declared tier coverage is green.
+
+### 16.7 CI Matrix (Phase 1)
+
+```
+                | arm64 (R0)   arm64 (R1)   amd64 (R2)   amd64-cpu (R3)
+----------------+----------------------------------------------------
+Unit            |     CI          CI           CI            CI
+Schema          |     CI          CI           CI            CI
+Integration     |     CI          CI           CI            CI (mock engine)
+Boot/VM         |    nightly     nightly      nightly         -
+Conformance     |    weekly       CI           CI            CI
+Perf/thermal    |   milestone      -            -             -
+Soak            |   milestone      -            -             -
+```
+
+R0 (Spark) is shared infrastructure; per-commit Spark runs are not
+expected. Nightly and weekly cadences are the realistic compromise.
+
+### 16.8 Testing the Self-Improvement Loop Safely
+
+Self-improvement (§9) is the most failure-prone subsystem. Testing
+policy:
+
+- A **shadow lane** runs every candidate against a frozen "golden
+  replay" of historic events. Divergence beyond a configured envelope
+  blocks adoption.
+- A **fault-injection harness** randomly fails capability calls
+  (returning wrong types, slow responses, partial writes) to verify the
+  rollback path actually rolls back.
+- A **reward-hacking detector** compares the candidate's metric
+  improvements against a held-out evaluation set the candidate has
+  never seen; suspicious gains are flagged for human review.
+- No candidate generated by the model under test may be evaluated by
+  the same model instance. The evaluator MUST be a separately-loaded
+  model (possibly a smaller, more conservative one) to break feedback
+  loops.
+
+### 16.9 Development Workflow Summary
+
+```
+[ developer laptop ]
+       |
+       |  edits + Tier-0 unit tests (MockEngine)
+       v
+[ git push -> CI ]
+       |
+       |  Tier-0/1 matrix; container build; conformance
+       v
+[ nightly VM boot tests ]
+       |
+       v
+[ weekly Spark soak / perf ]
+       |
+       v
+[ milestone deploy to Spark via signed bundle ]
+```
+
+The point of the ladder is that **a developer can be productive on a
+$1k laptop**, while the Spark stays an acceptance machine. If a
+developer's workflow requires the Spark for routine iteration, the
+ladder is broken and we have a bug to fix in tooling.
+
+---
+
+## 17. Prerequisites
+
+These are the things that MUST already exist (hardware, software,
+operational, organizational) before Phase-1 engineering can credibly
+begin. Anything below that is missing on day 1 becomes a project risk,
+not a feature.
+
+### 17.1 Hardware Prerequisites
+
+**Required for acceptance (Tier 3):**
+
+- 1× NVIDIA DGX Spark (or equivalent GB10-class machine), wired,
+  reachable from CI over a private VLAN.
+- Wired Ethernet to CI (the Spark MUST NOT depend on Wi-Fi for
+  acceptance runs).
+- A backup Spark or comparable ARM+GPU host SHOULD exist so a single
+  failure does not block all acceptance work.
+
+**Required for development (Tiers 0–2):**
+
+- One developer machine per active contributor: ≥ 16 GB RAM, ≥ 200 GB
+  SSD, Docker, KVM (Linux) or virtualization framework (macOS).
+- At least one shared **GPU build host** (e.g., a workstation with an
+  RTX 4090/5090 or Apple Silicon M3 Max/M4) to produce Tier-1 GPU
+  artifacts and run nightly perf checks.
+- A small **CPU-only ARM box** (Raspberry Pi 5 or equivalent) per
+  team for minimal-resource sanity checks.
+
+**Recommended:**
+
+- A second Spark for federation prototyping (§13) by Phase 2.
+- An out-of-band management path (BMC/IPMI/serial) to the Spark for
+  recovery; the spec assumes the recovery partition is reachable when
+  the primary boot fails.
+
+### 17.2 Software / Toolchain Prerequisites
+
+- **Host OS (Spark):** DGX OS (Ubuntu-derived) at vendor-supported
+  release. Until Phase 4, we do not ship a custom kernel.
+- **Cross toolchain:** Clang/LLVM ≥ 18, GCC ≥ 13, both with aarch64
+  and x86_64 targets. Rust stable + nightly for some sandbox tooling.
+- **Build system:** Bazel or Nix (TBD; **[A/B]**). Both produce
+  reproducible, hermetic builds across ARM64/x86_64. Picking neither
+  and using ad-hoc Make is rejected — reproducibility is mandatory.
+- **Container runtime:** containerd + nerdctl, plus the NVIDIA
+  Container Toolkit on GPU hosts.
+- **VM tooling:** QEMU ≥ 9.x, libvirt, cloud-init, and a foreign-arch
+  KVM bridge for x86_64-hosted ARM64 testing.
+- **Inference engines:** llama.cpp (primary), MLX (Apple), vLLM
+  (CUDA, optional for larger models). Pinned versions per release.
+- **Model artifacts:** at least one small (1–3B) and one large
+  (≥ 30B) GGUF model checked into model storage with hash manifests.
+  Licenses MUST be reviewed before any model is added.
+- **Schema tooling:** JSON Schema 2020-12 validators in CI; protobuf
+  for high-rate event paths; a grammar tool for constrained decoding
+  (GBNF or equivalent).
+- **Sandbox runtimes:** Wasmtime (or Wasmer) for WASM capabilities;
+  runc/youki + seccomp/landlock profiles for OCI capabilities;
+  Firecracker for VM-class isolation.
+- **Observability:** lightweight metrics (OpenMetrics), hash-chained
+  audit log writer, structured tracing limited to the supervisor
+  (NOT to userland capabilities by default).
+- **Crypto:** Ed25519 + X25519 for capability signing and KEX,
+  Sigstore-compatible signing for artifact provenance, TPM2 (or the
+  Spark's equivalent) for measured boot.
+- **Version control / CI:** Git with signed commits; CI with ARM64
+  and AMD64 runners; a Spark-attached runner for milestone jobs.
+
+### 17.3 Network / Service Prerequisites
+
+- A **model registry** (object storage + manifest service) for GGUF
+  blobs. Must support content-addressed retrieval and signed manifests.
+- A **capability registry** with the same properties for signed
+  capability bundles.
+- An **artifact / package mirror** so the Spark does not pull from the
+  open internet during acceptance runs (deterministic builds, security).
+- A **time source** (NTP or PTP) — capability rollouts and audit
+  chains depend on monotonic, accurate timestamps.
+- An **external-model endpoint** (Anthropic, OpenAI, or self-hosted
+  vLLM) for the Tier-0 RemoteEngine, with billing/quota controls and a
+  redaction policy in place before first use.
+
+### 17.4 Operational Prerequisites
+
+- **Bring-up runbook** for the Spark (firmware update, secure boot
+  enrollment, root key provisioning, recovery image install). Owned
+  by ops, version-controlled, drilled at least once per quarter.
+- **Backup/restore policy** for `/var/lib/gildos` (capability cache,
+  semantic memory, audit logs). Snapshots tested via restore, not just
+  taken.
+- **Incident response playbook** for the two most likely Phase-1
+  emergencies: (a) cognitive runtime in a wedged state, (b) a
+  capability adopted via the self-improvement loop misbehaves in
+  production.
+- **Kill switch.** A physically distinct path (out-of-band) to disable
+  AI control and drop the system into a maintenance shell. Not
+  optional; specified in §11 and re-stated here as a prerequisite.
+
+### 17.5 Organizational Prerequisites
+
+- **Two-person review** on any change to: the TCB, capability signing
+  keys, the self-improvement adoption policy, the security model.
+  Single-maintainer merges to these areas are rejected by policy and
+  by repo configuration.
+- **Security review owner** with veto power on §11-relevant changes.
+- **Hardware steward** responsible for Spark availability and the
+  physical lab.
+- **External-model usage policy** signed off by legal/privacy before
+  the Tier-0 RemoteEngine is enabled with any non-synthetic data.
+- **Honest milestone gates.** A milestone is met only when its
+  acceptance suite is green on R0 (Spark). "Demo passed" does not
+  count.
+
+### 17.6 Data Prerequisites
+
+- A corpus of **synthetic events** large enough to drive eventd
+  extractors and the semantic memory store under realistic load.
+  Synthetic before real — privacy first.
+- A **golden-replay set** of historic-style event traces for the
+  self-improvement shadow lane (§16.8).
+- A **conformance corpus** of prompts, tool-use scenarios, and
+  refusal cases used by the adversarial test suite.
+- A **redaction policy** capability and its test fixtures, in place
+  before any real user data is processed.
+
+### 17.7 Explicit Non-Prerequisites
+
+These are *not* required before Phase 1, despite recurring temptation:
+
+- A custom kernel.
+- An in-house inference engine.
+- A bespoke filesystem.
+- A graphical desktop.
+- A multi-node cluster.
+- A user-facing brand.
+
+Building any of those before §16's tier ladder is green on Spark is
+out of scope.
+
+### 17.8 Prerequisite Summary Matrix
+
+```
+            | Required day 1 | Required by M1.x       | Nice-to-have
+------------+----------------+-----------------------+----------------
+Hardware    | dev laptops    | 1× Spark              | 2nd Spark, BMC
+            | shared GPU box | ARM CI runner         | Pi 5 for sanity
+Toolchain   | Bazel|Nix,     | Wasmtime, runc,       | Firecracker
+            | LLVM, QEMU     | llama.cpp pinned      | vLLM
+Services    | git+CI,        | model registry,       | private package
+            | NTP            | capability registry   | mirror
+Ops         | runbook draft  | runbook drilled,      | quarterly DR test
+            |                | backup verified       |
+Org         | review policy, | security owner,       | external audit
+            | kill-switch    | hw steward            |
+Data        | synth events   | golden replay,        | privacy panel
+            |                | conformance corpus    |
+```
+
+---
+
+## 18. Open Research Questions
 
 Listed without sugar-coating.
 
-### 15.1 Unresolved Challenges
+### 18.1 Unresolved Challenges
 
 1.  **Context economy.** Even with tiered memory and retrieval, the
     model's working set is a hard constraint. We do not have a
@@ -1522,7 +2072,7 @@ Listed without sugar-coating.
     Tier B/C and small-model fallbacks help but are not yet adequate for
     portable devices.
 
-### 15.2 Dangerous Assumptions
+### 18.2 Dangerous Assumptions
 
 - That **constrained decoding is sufficient** for safety. It is
   necessary but not sufficient — a perfectly-formed tool call can still
@@ -1540,7 +2090,7 @@ Listed without sugar-coating.
   traditional shell. Likely false for power users; Gildos MUST ship
   good debug/CLI capabilities even if they are not the contract.
 
-### 15.3 Likely Dead Ends
+### 18.3 Likely Dead Ends
 
 - **Letting the AI rewrite the TCB.** Categorically: no. Any path that
   ends with model output being executed inside the trusted boundary is
@@ -1555,7 +2105,7 @@ Listed without sugar-coating.
   observation → measurement → bounded action. Anthropomorphizing it is
   a documentation hazard.
 
-### 15.4 Promising Breakthroughs
+### 18.4 Promising Breakthroughs
 
 - **Small specialized extractors.** A 1–3B local model dedicated to
   log-to-event distillation is plausibly cheap and high-leverage.
@@ -1572,7 +2122,7 @@ Listed without sugar-coating.
 - **Semantic memory with explicit decay.** A real alternative to the
   "stuff it in the prompt" pattern that dominates current AI apps.
 
-### 15.5 Honest Summary
+### 18.5 Honest Summary
 
 Gildos is plausible as an engineering project at Phase 1–2. The phases
 where the system rewrites itself (3) and where the kernel diverges from
@@ -1592,4 +2142,4 @@ become possible. If the boring parts are skipped, the system is a demo.
 
 ---
 
-*End of Specification, Revision 0.1.*
+*End of Specification, Revision 0.2.*
