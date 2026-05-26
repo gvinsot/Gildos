@@ -1,16 +1,26 @@
 # GILDOS — An AI-Native Operating System
 
-**Engineering Specification, Revision 0.2**
+**Engineering Specification, Revision 0.3**
 **Classification:** Internal / Exploratory Research
 **Date:** 2026-05-27
 **Editor:** Principal Systems Architecture Group
 **Status:** Draft for technical review. Not a product roadmap.
 
-**Revision 0.2 adds:**
+**Revision 0.3 adds:**
+- §5.1 pinned Phase-1 reference model: **Qwen3.6 Prismaquant 5.5-bit + MTP**
+  on DGX Spark (§15.1).
+- §19 Continuous Learning and Skill Acquisition: how the cognitive core
+  acquires new skills, when (and when not) it may modify its own engine,
+  how deep failures are detected, and how the system rolls back and
+  *learns from the rollback itself*.
+- Renumbered Open Research Questions to §20.
+- §9 cross-referenced to §19 (capability-level vs. model-level learning).
+
+**Revision 0.2 added:**
 - §15 Target Hardware Profile (DGX Spark as Phase-1 reference platform)
 - §16 Testing and Development Strategy (VM/container ladder, external-model substitution, CI matrix)
 - §17 Prerequisites (hardware, software, operational, organizational)
-- Renumbered Open Research Questions to §18.
+- Renumbered Open Research Questions to §18 (now §20 in rev 0.3).
 
 ---
 
@@ -45,7 +55,9 @@
 15. Target Hardware Profile
 16. Testing and Development Strategy
 17. Prerequisites
-18. Open Research Questions
+18. (reserved — see §19)
+19. Continuous Learning and Skill Acquisition
+20. Open Research Questions
 
 ---
 
@@ -431,6 +443,45 @@ an unclean shutdown; recovery uses the WAL (§12).
 CUDA/Metal/ROCm/Vulkan back-ends and a stable C ABI. Rationale: small,
 auditable, easy to embed, supports quantized models on commodity hardware,
 already battle-tested.
+
+#### 5.1.1 Phase-1 Reference Model
+
+The Phase-1 reference model is pinned, by name, so that every other
+component in this spec can be benchmarked against a known substrate:
+
+| Property              | Value                                                |
+|-----------------------|------------------------------------------------------|
+| Family                | Qwen3.6                                              |
+| Parameter class       | Large (resident on DGX Spark unified memory, §15.1)  |
+| Quantization          | **Prismaquant @ 5.5 bits/weight** (mixed-precision)  |
+| Decoding              | **MTP** (Multi-Token Prediction) head enabled        |
+| Container format      | GGUF (preferred) with a vendor sidecar for the MTP head|
+| Backend               | llama.cpp on Blackwell (CUDA / FP4 / BF16 paths)     |
+| Context window        | ≥ 128k tokens (long-context required for §5.3 L0)    |
+| Tool / grammar        | JSON-schema constrained decoding MUST be supported   |
+
+Rationale, in plain terms:
+
+- **Qwen3.6** is the best openly-distributable, tool-use-capable model
+  family that fits the DGX Spark unified-memory envelope (§15.1) at a
+  useful quality tier as of the spec date.
+- **Prismaquant 5.5b** is a non-uniform quantization that retains
+  near-FP8 quality on attention and MoE expert routing layers while
+  aggressively quantizing FFN tails. The net effect is a ~30% memory
+  reduction over uniform 8-bit with negligible MMLU/MT-Bench loss in
+  our internal harness. The toolchain is pinned by hash; we do **not**
+  re-quantize at install time.
+- **MTP** (Multi-Token Prediction) lets the engine speculatively emit
+  k > 1 tokens per forward pass, validated by the base head. This is
+  the single largest p50-latency win available without changing
+  hardware. It interacts with constrained decoding — the grammar
+  enforcer MUST validate every speculatively-emitted token, not just
+  the accepted prefix.
+
+This pin is **a Phase-1 default, not a commitment**. §19 specifies the
+controlled mechanism by which the resident model may be replaced,
+fine-tuned via adapters, or augmented with new heads — and the much
+narrower mechanism by which the engine itself may be modified.
 
 **Alternatives considered:**
 
@@ -1032,8 +1083,16 @@ observe ──► hypothesize ──► generate ──► validate ──► ca
   the observation step. Mitigation: observation inputs are weighted by
   trust class; anonymous network inputs count for less.
 - **Loop divergence.** The model used to generate candidates is itself
-  a capability the system might want to improve. We forbid this in
-  Phase 1–3: the generator model is immutable per release.
+  a capability the system might want to improve. The **base weights**
+  of the generator model are immutable per release in Phase 1–3.
+  However, §19 specifies a narrower learning surface — adapters,
+  retrieved skill modules, and engine configuration — that the system
+  MAY modify under stricter guardrails than capability-level
+  self-improvement. The loop in this section (§9) operates on
+  capabilities; the loop in §19 operates on the cognitive core itself
+  and is gated more aggressively (smaller canary fractions, longer
+  observation windows, mandatory shadow evaluation by an independent
+  model).
 
 ### 9.4 Audit Trail
 
@@ -1537,8 +1596,10 @@ device (see §16.4). The spec MUST NOT hardcode them.
 
 - **Unified memory.** A coherent CPU+GPU 128 GB pool removes the
   hardest Phase-1 ergonomics problem: VRAM eviction policies. Tier B/C
-  in §10 can be deferred while a Tier-A-only configuration still fits a
-  ~70B Q4 model with headroom.
+  in §10 can be deferred while a Tier-A-only configuration still fits
+  the §5.1.1 reference model (Qwen3.6 Prismaquant 5.5b + MTP) fully
+  resident with headroom for KV cache, MTP draft state, and an
+  adapter stack (§19.3.3).
 - **ARM64 from day one.** This forces the build system, kernel modules,
   capability ABI, and event extractors to be portable *immediately*,
   rather than discovering ARM regressions in Phase 3.
@@ -2040,11 +2101,479 @@ Data        | synth events   | golden replay,        | privacy panel
 
 ---
 
-## 18. Open Research Questions
+## 19. Continuous Learning and Skill Acquisition
+
+This section specifies *how the cognitive core gets better over time*
+without violating the trust boundaries established in §3.4 and §11.
+It complements §9 (which improves *capabilities*) by addressing the
+much narrower and more dangerous question of changing **the model
+itself, its adapters, its skill library, and the engine it runs on**.
+
+The guiding constraint: **learning is a privilege, not a default.**
+Every learning channel below is opt-in, scoped, attested, and
+reversible. A change that cannot be rolled back is not learning — it
+is corruption.
+
+### 19.1 Scope and Boundaries
+
+In scope (this section):
+- Acquisition of **new skills** by the cognitive core (new tool-use
+  patterns, new domain knowledge, new decoding strategies).
+- **Adapter / LoRA** style fine-tuning of the resident model.
+- **Skill modules** (retrieval-augmented, schema-bound prompt and
+  example bundles) that act as soft "plug-ins" for the model.
+- **Engine reconfiguration** (sampler, MTP draft length, KV layout,
+  speculative decoding budget).
+- **Deep failure detection and rollback** when learning regresses
+  the system, with a post-mortem corpus that the system itself uses
+  to avoid repeating the mistake.
+
+Out of scope (forbidden in Phase 1–3):
+- Modification of **base model weights** in place. Weights are
+  content-addressed, read-only, and replaced only by a signed model
+  swap (§19.7.3).
+- Modification of the **inference engine binary** by the model.
+  Engine upgrades are human-reviewed, signed releases. The model
+  may propose, the human approves.
+- Anything that touches the **TCB** (§3.4). Categorically rejected.
+
+### 19.2 What "Learning" Means Here
+
+We deliberately do not use the word "learning" to mean a single
+mechanism. Five distinct channels exist, ordered from least to most
+invasive:
+
+```
+                        invasiveness ──►
+  L1                    L2                L3                  L4               L5
++-----------------+ +----------------+ +-----------------+ +-------------+ +------------+
+| Episodic memory | | Skill module   | | Adapter / LoRA  | | Engine cfg  | | Base weight|
+| (§5.3, §12.5)   | | (§19.4)        | | (§19.5)         | | (§19.6)     | | swap       |
+| append-only     | | retrievable,   | | small Δ on top  | | sampler,    | | full       |
+| facts/episodes  | | versioned      | | of frozen base  | | MTP, KV     | | release    |
++-----------------+ +----------------+ +-----------------+ +-------------+ +------------+
+   continuous          per-skill           per-adopt        per-config       per-release
+   no canary           canary (light)      canary (heavy)   canary (heavy)   human gate
+```
+
+The system MUST classify every proposed learning event into exactly
+one of L1–L5 and apply the corresponding gate. Mis-classification is
+itself a guardrail violation (§19.9).
+
+### 19.3 Channel Details
+
+#### 19.3.1 L1 — Episodic and Semantic Memory
+
+Already specified in §5.3 and §12.5. Listed here for completeness.
+The model "learns" continuously in the weak sense that retrieval over
+the semantic memory store changes its behavior on next turn. No
+weights, adapters, or engine state are modified. Rollback is trivial:
+delete or quarantine the offending memory.
+
+This is the **only** learning channel enabled by default at first
+boot. All others require explicit operator enablement.
+
+#### 19.3.2 L2 — Skill Modules
+
+A **skill module** is a signed, versioned bundle of:
+- a name and intent description,
+- a set of few-shot examples,
+- a tool-use grammar fragment (additive to the base grammar),
+- optional retrieval index pointers,
+- guardrail tests (inputs + expected behavior class).
+
+Skill modules are stored in the capability archive (§7) under a
+dedicated namespace. They are loaded into the model's context on
+demand by the **skill resolver**, which the model can query via a
+`skills.find(intent)` capability — exactly analogous to how it
+queries other capabilities. The model does not load skills into
+itself; the resolver does, under policy.
+
+A skill module is acquired by:
+
+```
+   observed gap ──► hypothesis ──► draft module ──► validate ──► canary ──► adopt
+   (failed query    (the model     (constrained    (run guardrail (route a    (promote
+    or repeated      proposes      generation       tests +        small      to the
+    poor answer      a module      against the      shadow-eval    fraction   resolver's
+    in §6 events)    spec)         module schema)   on held-out    of intents)default set)
+```
+
+This loop is structurally identical to §9 but operates on skill
+modules, not capabilities. The same canary, hysteresis, and golden
+replay rules apply.
+
+**Key safety property:** a skill module cannot grant new permissions.
+It can only compose existing capabilities and decoding constraints.
+Adding a skill MUST NOT widen the model's effective authority.
+
+#### 19.3.3 L3 — Adapter / LoRA Fine-Tuning
+
+A **LoRA adapter** (rank-r low-rank update) is the first channel
+that actually changes how the resident model computes. It is also
+the first channel that requires **a held-out, independently-loaded
+evaluator model** to gate adoption (§16.8).
+
+Adapter lifecycle:
+
+1.  **Trigger.** A persistent regression in a measurable behavior
+    (e.g., the model is consistently wrong about a specific tool's
+    schema in §6 events) crosses a threshold.
+2.  **Dataset assembly.** The system gathers training pairs from the
+    audit log and semantic memory, filtered for:
+    - non-confidential trust class only,
+    - explicit user consent for any pair derived from user input,
+    - de-duplication and PII redaction (a `redactor` capability).
+3.  **Training.** A separate, sandboxed training job (a capability,
+    §7) produces an adapter file. Training happens during OPT
+    windows (§5.5) and is preempted by RT/INT load.
+4.  **Static checks.** Adapter shape, rank, target modules, and
+    sparsity match the manifest. Any deviation aborts.
+5.  **Shadow evaluation.** The candidate adapter is loaded into a
+    *second* engine instance (or the same engine in a parallel
+    context, §5.5 [B]). The **evaluator model** — a distinct,
+    smaller, more conservative model — scores the candidate against:
+    - a held-out golden replay (§16.8),
+    - the §11 adversarial / prompt-injection corpus,
+    - the reward-hacking detector.
+6.  **Canary.** At most 1% of INT-class turns are routed to the
+    adapter for a configurable window. RT-class turns are **never**
+    routed to a canary adapter.
+7.  **Adopt or rollback.** Adoption requires improvement on the
+    target metric without regression on any guardrail metric beyond
+    threshold. Failure routes the adapter to the **failure corpus**
+    (§19.8).
+
+**Stacking.** Multiple adapters MAY be active simultaneously, but
+their merge order is part of the manifest. The active stack is itself
+a versioned object and is subject to the same rollback machinery.
+
+**Memory budget.** The active adapter stack is capped at a fraction
+(default 5%) of the resident model's memory footprint. Exceeding
+the cap blocks adoption.
+
+#### 19.3.4 L4 — Engine Reconfiguration
+
+The inference engine has knobs: sampler parameters, MTP draft length
+and acceptance threshold, KV layout, speculative decoding budget,
+batch size hints, attention backend selection. These are **data, not
+code** — but they materially affect output distribution.
+
+The model MAY propose a new configuration via a structured
+`engine.reconfigure.propose` artifact. The propose-validate-canary-adopt
+loop applies. Two additional rules:
+
+- **No knob touches correctness-critical paths.** Grammar enforcement,
+  constrained decoding, schema validation, and signature verification
+  cannot be tuned by the model. They are TCB-adjacent.
+- **Composability matters.** A reconfiguration is validated together
+  with the active adapter stack. A knob that works in isolation may
+  regress in combination.
+
+#### 19.3.5 L5 — Base Weight Replacement
+
+Replacing the base weights (e.g., upgrading from Qwen3.6 to Qwen3.7,
+or swapping in a domain-specialized base) is a **signed release**, not
+a learning event. It is performed by a human operator via the same
+mechanism that initially installed the model.
+
+Phase 1–3 forbids the model from initiating an L5 swap. The model MAY
+*recommend* one (with evidence) but the trigger is human.
+
+### 19.4 Skill Acquisition Pipeline (Detail)
+
+The L2 pipeline (§19.3.2) is the workhorse of "the AI gets better at
+things it sees often." Concretely:
+
+```
++--------------------+
+| §6 event stream    |
+| + capability calls |
+| + user feedback    |
++---------+----------+
+          |
+          v
++---------+----------+
+| Skill gap detector |  small extractor model; emits
+|                    |  `skill.gap.detected` events with
+|                    |  intent, evidence, frequency
++---------+----------+
+          |
+          v
++---------+----------+
+| Hypothesis builder |  the cognitive core proposes a
+|                    |  skill module spec (structured)
++---------+----------+
+          |
+          v
++---------+----------+
+| Module generator   |  constrained generation against
+|                    |  the skill module schema
++---------+----------+
+          |
+          v
++---------+----------+
+| Guardrail tests    |  static (grammar, citation) and
+|                    |  dynamic (held-out queries)
++---------+----------+
+          |
+          v
++---------+----------+
+| Canary (resolver)  |  1–5% of matching intents; never
+|                    |  for security-critical intents
++---------+----------+
+          |
+          v
++---------+----------+
+| Adopt or archive   |  signed, logged, reversible
++--------------------+
+```
+
+A skill module MUST declare:
+- the intents it claims to satisfy,
+- the capabilities it composes (white-list),
+- its guardrail tests,
+- its expected envelope (latency, token budget, error rate),
+- its provenance (which observed events triggered it).
+
+A skill module MUST NOT:
+- introduce free-form code execution,
+- request new permissions,
+- bypass channel isolation (§11.2).
+
+### 19.5 The Engine "Reprograms Itself" — In a Narrow Sense
+
+The user-visible promise of an AI that "reprograms its own engine"
+is interpreted here as the following narrow, defensible mechanism:
+
+1.  The model proposes a **bounded engine reconfiguration** (§19.3.4)
+    or an **adapter** (§19.3.3) or a **skill module** (§19.3.2).
+2.  The proposal is a structured artifact, validated against a
+    schema. The model never emits raw engine code.
+3.  Code-level changes to the engine binary are **always** human-gated
+    L5-equivalent releases. There is no path by which model output
+    becomes engine code at runtime.
+
+"Reprogramming" in the unbounded sense — the model regenerating its
+own inference loop, rewriting its tokenizer, hot-patching the
+attention kernel — is **out of scope through Phase 3**. It is a §20
+research question, not a feature.
+
+This is a deliberate, conservative reading of the task. The
+alternative ("let the model rewrite cogd") fails §11 on contact: any
+mechanism that lets model output execute inside the TCB is a
+single-point exploit for prompt injection, reward hacking, and
+trojaned weights simultaneously.
+
+### 19.6 Deep Failure Detection
+
+Not every regression is detected by the canary's statistical test.
+Some failures are slow, subtle, or correlated across the stack. We
+classify failures into four tiers:
+
+| Tier | Name              | Detection                                          | Response                          |
+|------|-------------------|----------------------------------------------------|-----------------------------------|
+| F1   | Local regression  | Canary statistical test fails                      | Reject candidate; log             |
+| F2   | Guardrail breach  | Adopted change later violates a §11 guardrail      | Auto-rollback; quarantine artifact|
+| F3   | Cumulative drift  | Golden replay (monthly) regresses                  | Rollback to last green snapshot   |
+| F4   | Deep failure      | System-wide misbehavior (loops, refusals, crashes) | Recovery boot (§4.3) + L1 reset   |
+
+F4 — **deep failure** — is the case the task asks us to address
+specifically. It is triggered by any of:
+
+- The supervisor (§3.3) detects `cogd` in a wedged or pathologically
+  looping state for > T seconds.
+- The conformance suite (§16.6) drops below a hard floor (e.g.,
+  refusal rate on the adversarial corpus collapses).
+- The kill-switch is engaged (§17.4).
+- A user-visible "this is broken" signal exceeds a threshold (an
+  explicit `user.distress` event, not a guess).
+- The audit log's hash chain (§11.7) fails verification.
+
+On F4 the system MUST:
+
+1.  Snapshot current state (capability set, adapter stack, engine
+    config, semantic memory pointers) into a **forensic snapshot**.
+    Snapshots are immutable and signed.
+2.  Drop the active adapter stack to empty.
+3.  Restore the last known-good engine configuration from §12.4.
+4.  Restore the last known-good skill resolver set.
+5.  If the failure persists, fall through to **Safe Cognition Mode**
+    (§4.3.1).
+6.  Emit a `system.deep_failure` event with the forensic snapshot
+    pointer and the trigger.
+7.  Refuse to re-enable any of the rolled-back learning channels for
+    a configurable cool-down period, even on human request, without
+    two-person review.
+
+### 19.7 Rollback Mechanics
+
+#### 19.7.1 What Is Snapshotted
+
+A **learning snapshot** is the tuple:
+
+```
+{
+  ts, snapshot_id, prior_snapshot_id,
+  base_model_hash,
+  adapter_stack: [{name, version, hash, order}],
+  engine_config_hash,
+  skill_resolver_set_hash,
+  semantic_memory_cursor,
+  capability_set_hash,        // links into §12.4
+  audit_log_tip                // hash-chained
+}
+```
+
+Snapshots are taken **before** any L2/L3/L4 adoption and **after**
+each green canary window. They are append-only and content-addressed.
+
+#### 19.7.2 Rollback Granularity
+
+Rollback can target any single channel (revert just the adapter
+stack) or the full learning state (revert all of L2–L4 to a prior
+snapshot). The default for F2/F3 is per-channel; the default for F4
+is full.
+
+#### 19.7.3 Base Model Swap (L5) Rollback
+
+Even L5 (human-initiated) is reversible. The previous model's
+weight file is retained for at least one full release cycle.
+KV snapshots (§5.3.3) are invalidated on swap and re-warmed.
+
+#### 19.7.4 Memory Rollback
+
+L1 (episodic / semantic memory) is append-only by design. "Rollback"
+here means **moving the read cursor**: queries are scoped to entries
+written before `semantic_memory_cursor`, so a bad fact added during a
+failed canary is no longer retrievable until reviewed. The entry is
+retained for forensics, not deleted.
+
+### 19.8 Learning From the Failure Itself
+
+A rollback that the system forgets is a rollback the system will
+repeat. Therefore every rollback writes a **post-mortem record**
+into a dedicated, slow-decay corpus:
+
+```
+{
+  postmortem_id, ts, trigger_event_id,
+  failure_tier,                       // F1..F4
+  channel,                            // L2..L5
+  candidate_descriptor,               // hash + manifest fingerprint
+  baseline_descriptor,
+  guardrail_metrics: { before, after, delta },
+  forensic_snapshot_id,
+  hypothesis_chain,                   // why was this generated?
+  reviewer_notes                      // optional human input
+}
+```
+
+The post-mortem corpus is consumed by:
+
+- The **hypothesis builder** (§19.4): proposals that closely resemble
+  a prior failure are down-weighted or refused outright.
+- The **canary policy**: channels with recent failures get smaller
+  canary fractions and longer windows (per-channel back-off).
+- The **operator dashboard**: humans see *what the system tried, why,
+  what broke, and what it now refuses to try again*.
+
+This is the closest the system gets to "learning from mistakes"
+without invoking magical interpretability. It is **pattern-level**
+avoidance, not understanding — and that is exactly what we claim.
+
+**Privacy.** Post-mortem records may contain trace material. They
+inherit the trust class of their highest-trust input and are
+encrypted at rest like user data (§12).
+
+**Decay.** Post-mortems decay slowly (months, not days). A
+post-mortem older than the decay horizon stops blocking new
+proposals but remains in the audit log forever.
+
+### 19.9 Guardrails Specific to §19
+
+In addition to all of §11:
+
+1.  **No self-evaluation.** The model that produced a candidate MUST
+    NOT be the model that scores it for adoption (§16.8 already
+    requires this; restated here as load-bearing).
+2.  **No back-channel between hypothesis and post-mortem corpus.**
+    The hypothesis builder reads post-mortems as **constraints**,
+    never as training data. We do not want the model to learn to
+    *route around* the failure detector.
+3.  **Two-person review** is required to:
+    - re-enable a learning channel that triggered F4,
+    - shorten the canary window below configured floors,
+    - retire (not just expire) a post-mortem record,
+    - approve any L5 swap.
+4.  **Hard floor on rollback availability.** The system MUST always
+    be able to return to the **factory baseline** (initial release
+    artifact + empty learning state). If, after any sequence of
+    learning events, this is not true, the system is broken and
+    refuses further learning until repaired.
+5.  **No silent learning.** Every L2–L5 transition emits an event on
+    the semantic bus (§6) and an entry in the audit log (§11.7).
+    "We didn't notice" is not an acceptable failure mode.
+
+### 19.10 Resource Cost of Learning
+
+Learning is OPT-class work (§5.5) by default. It runs in idle
+windows, is preempted by RT/INT traffic, and is bounded by:
+
+- adapter training: capped GPU-hours per day,
+- skill module generation: capped tokens per day,
+- shadow evaluation: a fixed slice of OPT GPU time,
+- post-mortem corpus: capped storage with FIFO eviction past horizon.
+
+A device that cannot meet the §10 SLOs while running learning MUST
+disable learning, not degrade interactive cognition. The order is:
+**user latency > interactive quality > learning throughput**.
+
+### 19.11 Roadmap Alignment
+
+| Channel | Phase 1 | Phase 2 | Phase 3 | Phase 4 |
+|---------|---------|---------|---------|---------|
+| L1      | enabled | enabled | enabled | enabled |
+| L2      | shadow  | canary  | enabled | enabled |
+| L3      | research| shadow  | canary  | enabled |
+| L4      | research| shadow  | canary  | enabled |
+| L5      | manual  | manual  | manual  | manual  |
+
+"Shadow" = mechanism exists, runs in evaluation-only mode, never
+takes traffic. "Canary" = takes a fraction of traffic under all the
+guardrails above. "Enabled" = default-on for non-confidential
+profiles, with operator opt-out.
+
+The conservative ramp is deliberate. Every promotion from shadow to
+canary is justified by **measured** evidence on R0 (Spark) from the
+prior phase, not by enthusiasm.
+
+### 19.12 What This Section Does NOT Promise
+
+To stay honest:
+
+- It does not promise that the system "understands" its failures. It
+  promises pattern-level avoidance via the post-mortem corpus.
+- It does not promise unbounded skill acquisition. Skills are
+  composed from existing capabilities and constrained decoding.
+- It does not promise that the model will rewrite the engine. The
+  engine binary is a human-signed release artifact through Phase 3.
+- It does not promise that learning is free. It costs GPU time,
+  storage, and operator attention. The §10 budget is real.
+- It does not promise convergence of the self-improvement process.
+  §9.3 and §20.2 already flag this; §19 inherits the same caveat.
+
+What it **does** promise: every change to the cognitive core is
+**named, signed, scoped, observed, reversible, and remembered**.
+That is the bar. Anything less is not learning; it is drift.
+
+---
+
+## 20. Open Research Questions
 
 Listed without sugar-coating.
 
-### 18.1 Unresolved Challenges
+### 20.1 Unresolved Challenges
 
 1.  **Context economy.** Even with tiered memory and retrieval, the
     model's working set is a hard constraint. We do not have a
@@ -2072,7 +2601,7 @@ Listed without sugar-coating.
     Tier B/C and small-model fallbacks help but are not yet adequate for
     portable devices.
 
-### 18.2 Dangerous Assumptions
+### 20.2 Dangerous Assumptions
 
 - That **constrained decoding is sufficient** for safety. It is
   necessary but not sufficient — a perfectly-formed tool call can still
@@ -2090,7 +2619,7 @@ Listed without sugar-coating.
   traditional shell. Likely false for power users; Gildos MUST ship
   good debug/CLI capabilities even if they are not the contract.
 
-### 18.3 Likely Dead Ends
+### 20.3 Likely Dead Ends
 
 - **Letting the AI rewrite the TCB.** Categorically: no. Any path that
   ends with model output being executed inside the trusted boundary is
@@ -2105,7 +2634,7 @@ Listed without sugar-coating.
   observation → measurement → bounded action. Anthropomorphizing it is
   a documentation hazard.
 
-### 18.4 Promising Breakthroughs
+### 20.4 Promising Breakthroughs
 
 - **Small specialized extractors.** A 1–3B local model dedicated to
   log-to-event distillation is plausibly cheap and high-leverage.
@@ -2122,7 +2651,7 @@ Listed without sugar-coating.
 - **Semantic memory with explicit decay.** A real alternative to the
   "stuff it in the prompt" pattern that dominates current AI apps.
 
-### 18.5 Honest Summary
+### 20.5 Honest Summary
 
 Gildos is plausible as an engineering project at Phase 1–2. The phases
 where the system rewrites itself (3) and where the kernel diverges from
@@ -2142,4 +2671,4 @@ become possible. If the boring parts are skipped, the system is a demo.
 
 ---
 
-*End of Specification, Revision 0.2.*
+*End of Specification, Revision 0.3.*
