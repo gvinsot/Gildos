@@ -1580,4 +1580,499 @@ Listed without sugar-coating.
 
 ---
 
-*End of specification, Revision 0.4.*
+*End of specification, Revision 0.4.*---
+---
+
+# Revision 0.5 Addendum
+
+This addendum collects the additions made in Revision 0.5 on top of
+Revision 0.4. They are presented here rather than woven into the
+sections above to keep the diff clean and reviewable. A future
+Revision 0.6 SHOULD re-integrate them into their logical positions
+(§1.5, §4.4.7–9, §4.4.10, §6.7, §20).
+
+**Summary of additions:**
+
+- §1.5 **Minimum Viable Gildos** — a concrete 90-day MVP definition;
+  the reachability anchor for the project.
+- §4.4.7 **Cognitive Fork (`kvfork`)** — copy-on-write KV-cache clone
+  for tree-of-thoughts and shadow evaluation.
+- §4.4.8 **Persistent Prompt Objects (`promptpin`)** — kernel-pinned
+  shared system prompts; first-token-after-login drops to milliseconds.
+- §4.4.9 **Cognitive cgroups (`cogcg`)** — tokens/sec, context-tokens,
+  GPU-seconds, tool-calls-per-turn as accountable kernel resources.
+- §4.4.10 **Updated syscall summary** — 17 syscalls total (was 11),
+  still under the 20-syscall design budget.
+- §4.7+ **Conformance suites** for `kvfork`, `promptpin`, `cogcg`.
+- §6.7 **End-to-end walkthrough** — one user turn from mic to spoken
+  reply, naming every subsystem and every kernel primitive touched.
+- §20 **Glossary**.
+
+---
+
+## §1.5 Minimum Viable Gildos (90-day MVP)
+
+A spec without a concrete first deliverable rots into philosophy. The
+**Minimum Viable Gildos** (MVG) is the smallest artifact that proves
+the thesis is engineerable. Everything else in this document — the
+self-improvement loop, generated drivers, federation, the μKernel — is
+*after* the MVG exists.
+
+**Hardware.** One Linux x86_64 workstation with an RTX 4090 or 5090
+(the developer can build this; the Spark comes later). 32 GB RAM, 1 TB
+NVMe Gen4. No special peripherals.
+
+**Software (everything pinned by hash):**
+
+- Linux LTS 6.x with `gildos-kmod` providing the §4.4 primitives, of
+  which only **four are MVG-mandatory** (`dmload`, `vramctl`,
+  `sched_cog`, `schedio`). The other five are wired but stubbed.
+- `gildosvisor` as PID 1, with a single signing key.
+- `cogd` running llama.cpp with a 7–8B Qwen-class GGUF model
+  (sub-reference; not Prismaquant, not MTP — those are Phase-1-full,
+  not MVG).
+- `eventd` with three extractors: kernel ring, journald, thermals.
+- `capd` with Wasmtime Component Model and three reference
+  capabilities: `user.notify`, `clock.now`, `events.query`.
+- `memd` with LMDB only (no vector index yet).
+- AI gateway capability exposing one HTTPS endpoint.
+
+**User-visible behavior (the MVG demo).** The user opens a browser tab
+to `https://localhost`, authenticates with an OS token, and types:
+
+> *"What's the temperature of my GPU right now, and notify me if it
+> goes above 80°C in the next minute."*
+
+The system MUST:
+
+1.  Authenticate the request at the gateway.
+2.  Route the prompt to `cogd`; assemble context including the
+    `events.query` and `user.notify` capability docs from `memd`.
+3.  Emit a constrained tool call `events.query(topic="device.thermal.*",
+    window="now")` and stream back the current temperature.
+4.  Emit a second tool call `events.subscribe(topic="device.thermal.gpu",
+    threshold=80, ttl="60s", action="user.notify")`.
+5.  Speak / display the answer and the subscription confirmation.
+6.  When (or if) the thermal extractor publishes
+    `device.thermal.gpu severity=warning value>80`, the subscription
+    fires and `user.notify` produces a browser notification within
+    one second.
+
+**Acceptance gates for MVG.**
+
+- Cold boot to *first token* ≤ 20 s on the reference workstation.
+- P50 first-token latency in the demo ≤ 600 ms.
+- The model **must not be evictable** from VRAM by any user GPU
+  workload launched concurrently (verify with `glmark2` running in
+  parallel).
+- `dmload` saturates ≥ 80 % of the NVMe Gen4 read bandwidth during
+  model load.
+- The full audit log of the demo can be exported with `gildosctl audit
+  export`; every tool call, capability load, and event subscription
+  has a signed entry.
+- Recovery boot works: after one deliberate `panic()` in a capability,
+  the next boot lands in Safe Cognition Mode with the demo still
+  functional.
+
+**Out of MVG scope (deliberately):** the self-improvement loop,
+generated drivers, multi-user contexts, federation, learning channels
+L2–L5, the Prismaquant + MTP reference model, the cognitive fork
+primitive, the speculative syscall prefetch. These ship in later
+Phase-1 milestones (§18.2 M1.x).
+
+**Person-effort estimate for MVG.** ~3 person-years over the 90 days
+(see §18.3 line items, MVG slice ≈ 30 % of full Phase-1 effort).
+
+The MVG is the moment the project goes from a spec to a system. Every
+later deliverable — the Spark port, the Prismaquant model, the
+self-improvement loop, the μKernel — is layered on top without
+re-thinking the architecture.
+
+---
+
+## §4.4.7 Cognitive Fork (`kvfork`)
+
+**Pain.** Tree-of-thoughts, beam search, and "what if I answer X?"
+exploration all require running the model from a shared prefix down
+multiple divergent branches. On a stock engine this means re-prefilling
+the prompt for each branch, which is the most expensive step of
+inference.
+
+**Mechanism.** With a paged-attention engine, the KV cache is a
+collection of fixed-size blocks. `kvfork(context_handle)` returns a
+new context handle whose page table starts as a **copy-on-write clone**
+of the parent's. Reads share physical pages; writes (new tokens) trigger
+allocation only for the appended blocks. Forks are cheap: O(page-table
+entries), not O(context tokens).
+
+```
+parent ctx pages:  [P0][P1][P2][P3]
+                       │  │  │  │
+fork() →           ────┼──┼──┼──┴── branch A appends [P4a]
+                       │  │  └───── branch B appends [P3'][P4b]
+```
+
+The kernel exposes:
+
+```
+kvfork(parent_handle)                     -> child_handle
+kvmerge(handles[], policy)                -> merged_handle
+kvdiscard(handle)                         -> 0
+```
+
+`kvmerge` policies include `take-best` (by a scoring callback),
+`majority-vote`, and `concat`. Merge is a userspace operation in
+Phase 1 (cogd-side reducer); the kernel just frees the unused branches.
+
+**Outcome.** Tree-of-thoughts becomes an OS primitive, not an
+application pattern. A self-improvement candidate (§10) can be
+evaluated against a *forked* cognitive state instead of a fresh
+inference, slashing the cost of "did this candidate make the model
+worse?" tests. This may be the single largest leverage point for the
+learning loop in §11.
+
+**Caveat [O].** Reward-hacking-via-fork: the model could discover that
+forking and reporting only the best branch as its answer biases
+self-evaluation. §11.6 forbids the model from being its own evaluator;
+that rule extends to forks.
+
+---
+
+## §4.4.8 Persistent Prompt Objects (`promptpin`)
+
+**Pain.** Every multi-user instance (or every restart) re-prefills the
+same system prompt, the same persona, the same retrieval cache header.
+For a 4k-token system prompt on a large model, this is hundreds of
+milliseconds per session and a significant fraction of cold-boot
+latency.
+
+**Mechanism.** A **persistent prompt object** is a tuple
+`(prompt_text, tokenization_hash, KV_prefix_blob)` stored in a signed,
+content-addressed entry on the model partition. `promptpin(prompt_id,
+context_handle)` maps the KV prefix into the new context's page table
+as read-only shared pages.
+
+```
+promptpin(prompt_id, ctx)                 -> 0
+promptunpin(prompt_id, ctx)               -> 0
+```
+
+A prompt object is invalidated by any change to: the model hash, the
+quantization, the engine version, or the tokenizer. Invalidation is
+detected by `cogd` and triggers re-prefill + re-pinning on next boot.
+
+Multiple user contexts on the same `cogd` instance share one physical
+copy of the prefix's KV pages. On the Spark with 128 GB unified memory,
+this is mainly a latency win; on smaller devices, it is also a memory
+win.
+
+**Outcome.** "First token after login" drops to single-digit
+milliseconds for users sharing a base persona. Cold boot's KV-restore
+step becomes a `promptpin` call, not a re-prefill.
+
+---
+
+## §4.4.9 Cognitive cgroups (`cogcg`)
+
+**Pain.** Linux cgroups account for CPU, RAM, and IO. They do not know
+about *tokens*, *context-tokens*, or *GPU-seconds*. In a multi-user or
+multi-tenant Gildos instance, this means one runaway agent can starve
+every other consumer of cognition.
+
+**Mechanism.** A cognitive cgroup is a regular cgroup with extra
+controllers:
+
+| Controller                       | Unit                | What it limits                       |
+|----------------------------------|---------------------|--------------------------------------|
+| `cogcg.tokens_per_sec.max`       | tokens / second     | Output token rate                    |
+| `cogcg.context_tokens.max`       | tokens              | Sum of resident KV across cohort     |
+| `cogcg.gpu_seconds.daily`        | GPU-seconds / day   | Total inference budget               |
+| `cogcg.tool_calls.max_per_turn`  | count               | Tool-use ceiling per reasoning loop  |
+| `cogcg.class.allowed`            | {RT,INT,BG,OPT}     | Which `sched_cog` classes are usable |
+
+Accounting is done in `cogd` and pushed to the kernel on every
+generation step via:
+
+```
+cogcg_account(cgroup_id, tokens, gpu_ns, ctx_tokens) -> 0
+```
+
+The kernel enforces ceilings: a generation that would exceed a quota
+returns `EQUOTA` and the offending context is suspended (not killed).
+The user is told via a typed event so the model can self-explain.
+
+**Outcome.** Multi-user, multi-tenant cognition with hard isolation.
+Background learning (§11) gets its own cgroup with strict daily
+GPU-seconds caps; an experimental capability gets a tiny one;
+interactive users get generous ones. The OS, not the application,
+enforces it.
+
+---
+
+## §4.4.10 Updated summary of new syscalls
+
+The complete Phase-1 surface added by `gildos-kmod`, superseding the
+rev-0.4 §4.4.7 table:
+
+```
+# §4.4.1 DirectModelLoad
+dmload(fd, offset, len, vram_handle)         -> bytes_loaded
+
+# §4.4.2 Tensor handles
+tensorbuf_create(shape, dtype, device)       -> handle
+tensorbuf_share(handle, target_pid)          -> fd
+
+# §4.4.3 Cognitive scheduling class
+sched_cog_set_class(pid, class, flags)       -> 0
+
+# §4.4.4 Semantic syscall rings
+schedio_register(ring_fd, schema_uri)        -> 0
+schedio_submit(ring_fd, event_cbor)          -> 0
+
+# §4.4.5 Speculative syscall prefetch
+sycache_speculate(call_descriptor)           -> spec_token
+sycache_commit(spec_token)                   -> result
+sycache_cancel(spec_token)                   -> 0
+
+# §4.4.6 VRAM as first-class resource
+vramctl_reserve(bytes, flags)                -> vram_handle
+vramctl_release(vram_handle)                 -> 0
+
+# §4.4.7 Cognitive fork
+kvfork(parent_handle)                        -> child_handle
+kvmerge(handles[], policy)                   -> merged_handle
+kvdiscard(handle)                            -> 0
+
+# §4.4.8 Persistent prompt objects
+promptpin(prompt_id, ctx)                    -> 0
+promptunpin(prompt_id, ctx)                  -> 0
+
+# §4.4.9 Cognitive cgroups
+cogcg_account(cgroup_id, tokens, gpu_ns, ctx_tokens) -> 0
+```
+
+**Seventeen syscalls.** That is the entire AI-native surface above the
+host kernel. Compare to the ~400 syscalls Linux exposes today; the
+design budget is to never exceed twenty. The three syscalls of headroom
+(20 − 17) are reserved for unforeseen needs discovered during the MVG
+and early Phase 1; spending any of them requires a spec amendment.
+
+---
+
+## §4.7+ Additional conformance suites
+
+These are gating tests for any kernel-module change. Failure means the
+change does not merge. They extend the rev-0.4 §4.7 list:
+
+- `kvfork`: fork a 32k-token context 64 ways, assert page-table COW
+  works (one physical copy until divergence), assert fork + first new
+  token < 5 ms.
+- `promptpin`: pin a 4k-token prompt object across 16 contexts, assert
+  one physical KV-prefix copy, assert first-token latency < 50 ms on
+  the second and subsequent sessions.
+- `cogcg`: drive a cgroup over its `tokens_per_sec.max`, assert
+  `EQUOTA` is returned and the context is suspended (not killed),
+  assert the accounting matches `cogd`'s self-reported usage to within
+  1 %.
+
+---
+
+## §6.7 End-to-end walkthrough — one user turn
+
+To make "how it all works together" concrete, trace one complete user
+turn from microphone to spoken reply. Every named subsystem and every
+kernel primitive used is annotated. This is the MVG (§1.5) demo
+extended slightly to exercise more of the stack.
+
+**Scenario.** A user wearing a Bluetooth headset says:
+
+> *"Open my last presentation and tell me what slide 4 was about."*
+
+```
+ [0 ms]   Microphone → USB audio driver (vendor)
+              │  raw PCM frames
+              ▼
+ [t+5 ms] audio.capture (WASM capability)
+              │  emits gildos/audio.frame@1 events into a schedio ring (§4.4.4)
+              │  using tensorbuf for the raw PCM (§4.4.2)
+              ▼
+ [t+10 ms] speech.stt (WASM capability, runs a small Whisper-class model)
+              │  consumes audio.frame, emits gildos/speech.transcript@1
+              │  relevance=0.95 (active user input)
+              ▼
+ [t+200 ms] eventd routes the transcript to cogd subscribers
+              │  cogd's INT-class reasoning loop is woken (sched_cog, §4.4.3)
+              ▼
+ [t+205 ms] cogd: context assembly
+              │  - pinned system prompt is already in VRAM via promptpin (§4.4.8)
+              │  - persistent persona KV prefix is shared
+              │  - memd retrieves: "user.last_presentation" (semantic memory)
+              │  - capability docs for "files.open" and "doc.slides" are RAG'd in
+              ▼
+ [t+220 ms] cogd: constrained generation begins
+              │  MTP head speculates ahead; sycache (§4.4.5) is told:
+              │    "this looks like files.open(uri=...) — pre-stat it"
+              │  kernel begins reading the file's metadata in the background
+              ▼
+ [t+280 ms] First tool-call token sequence committed:
+              │  { "tool": "files.open",
+              │    "args": { "uri": "memory://user.last_presentation" } }
+              │  sycache_commit returns the pre-fetched stat result instantly
+              ▼
+ [t+285 ms] capd dispatches to files.open (WASM capability):
+              │  - signature/permission check (Wasmtime + LSM, §8)
+              │  - returns a tensorbuf handle to the file bytes (§4.4.2)
+              ▼
+ [t+300 ms] cogd: next constrained generation emits:
+              │  { "tool": "doc.slides.extract",
+              │    "args": { "file_handle": "<tensorbuf id>", "slide": 4 } }
+              ▼
+ [t+340 ms] doc.slides.extract maps the tensorbuf (zero-copy),
+              │  parses the .pptx, returns a small JSON payload:
+              │    { "title": "Q2 Forecast", "bullets": [...] }
+              ▼
+ [t+360 ms] cogd: free-form generation begins (response to user)
+              │  Token stream is INT class; kvfork (§4.4.7) is NOT used here
+              │  (no branching needed). A summary is produced.
+              ▼
+ [t+500 ms] cogd: streams response tokens to speech.tts capability
+              │  speech.tts writes audio frames into a tensorbuf,
+              │  shared with audio.output (vendor driver)
+              ▼
+ [t+520 ms] First spoken phoneme reaches the user's headset
+              │  Subsequent words stream as generation proceeds
+              ▼
+ [t+...]   eventd publishes: self_improvement.observation
+              │    { "capability": "doc.slides.extract", "latency_ms": 40, "ok": true }
+              │  This goes to memd; the §10 self-improvement loop will
+              │  later score whether doc.slides.extract has a faster
+              │  candidate. The user has long since moved on.
+```
+
+**What was actually new versus a stock Linux box running llama.cpp:**
+
+- The transcript was delivered as a *typed event*, not a parsed string
+  (§4.4.4). Zero context wasted on `>>> STT: "open my last..."`.
+- The model never saw a file path; `files.open` returned a *tensor
+  handle* and the next capability operated on it in place (§4.4.2).
+- The file was pre-`stat`'d during decoding via speculative prefetch
+  (§4.4.5), shaving ~10 ms off perceived latency.
+- The system prompt and persona were already resident; no prefill
+  (§4.4.8).
+- The reasoning loop ran in `sched_cog` INT class, so a background
+  `make` from another shell could not stall the user (§4.4.3).
+- The audit log captured every step with signed lineage (§12.4) —
+  later the user can ask *"why did you open that file?"* and get a
+  precise answer.
+
+**Failure modes are also concrete.**
+
+- If `files.open` is unsigned or revoked → the dispatch fails at the
+  policy engine, never reaches the capability. cogd is told via a
+  typed event and informs the user.
+- If `doc.slides.extract` exceeds its `cogcg` quota (§4.4.9) → the
+  call returns `EQUOTA`; cogd falls back to a slower in-context
+  parsing path or asks the user.
+- If thermals trip during generation → a critical event preempts
+  the loop (§7.5); cogd finishes the current sentence and yields.
+- If the system was deliberately broken by a bad capability candidate
+  → recovery boot (§5.2) restores the golden capability set and the
+  user keeps working.
+
+This is one turn. The MVG (§1.5) requires a turn like this to complete
+within SLO on commodity hardware. Everything else in the spec exists to
+make this turn either *faster, safer, or more capable* over time.
+
+---
+
+## §20 Glossary
+
+Terms appear here only if they are used in a Gildos-specific way or if
+their common meaning has been narrowed.
+
+- **Capability.** The smallest installable unit of behavior. A signed
+  WASM Component with a JSON-Schema interface, a permission set, a
+  resource budget, and a provenance record. Replaces "application,"
+  "driver," "service," "shell utility." See §8.
+- **Cognitive cgroup (`cogcg`).** A Linux cgroup extended with
+  controllers for tokens/sec, context-tokens, GPU-seconds, and
+  permitted scheduling classes. Enforces hard isolation between
+  cognition consumers. See §4.4.9.
+- **Cognitive Fork (`kvfork`).** A copy-on-write clone of a KV cache.
+  Enables tree-of-thoughts and shadow evaluation without re-prefill.
+  See §4.4.7.
+- **Cognitive scheduling class (`sched_cog`).** A kernel scheduling
+  class with four priorities — RT, INT, BG, OPT — that protect the
+  resident model from arbitrary preemption. See §4.4.3.
+- **`cogd`.** The cognitive daemon. Owns the inference engine, the
+  KV cache, and the reasoning loop. TCB-adjacent. See §6.
+- **DirectModelLoad (`dmload`).** Zero-copy NVMe → VRAM streaming of
+  signed model weights. Bypasses the page cache. See §4.4.1.
+- **Extractor.** A small, signed program (kernel-resident when
+  possible) that converts a raw byte stream into typed semantic
+  events. See §7.2.
+- **`gildos-kmod`.** The set of out-of-tree Linux kernel modules
+  implementing the §4.4 AI-native primitives. Phase 1 deliverable.
+- **`gildosvisor`.** PID 1 in Gildos. A small Rust microvisor that
+  verifies signatures, opens the TPM, loads policy, and supervises
+  daemons. TCB. See §3.2.
+- **Golden capability set.** The frozen baseline of capabilities
+  shipped with a system image. Used by Safe Cognition Mode (§5.2).
+- **Golden replay.** A frozen benchmark suite that any path of
+  self-improvements must continue to pass. See §10.3.
+- **Hard constraint.** A property enforced mechanically by the policy
+  engine, sandbox, or kernel — *not* by prompt-level instruction. See
+  §12.3.
+- **Hypothesis.** A structured artifact `{target, metric, approach,
+  expected_delta, risk}` that drives a self-improvement candidate or
+  a learning proposal. See §10.2, §11.2.
+- **Interaction surface.** An optional capability that translates
+  external I/O (voice, GUI, HTTPS) into bus events. Not part of the
+  contract; replaceable.
+- **KV cache.** The model's attention state for a context. Lives in
+  VRAM; the most expensive resource on the GPU. See §6.3.
+- **Learning channel.** A specific surface on which the cognitive core
+  may change — memory (L1), skill modules (L2), engine config (L3),
+  adapters (L4), base-model swap (L5). See §11.1.
+- **MTP.** Multi-Token Prediction. A speculative-decoding head that
+  emits k>1 tokens per forward pass. See §6.1.1.
+- **MVG.** Minimum Viable Gildos. The 90-day MVP definition that
+  proves the thesis is engineerable. See §1.5.
+- **Persistent Prompt Object (`promptpin`).** A signed,
+  content-addressed `(prompt, tokenization, KV-prefix)` tuple that can
+  be mapped read-only into multiple contexts. See §4.4.8.
+- **Post-mortem record.** An append-only artifact written on every
+  rollback. Used by the hypothesis builder as a *constraint* to avoid
+  repeating failures. See §11.5.
+- **Promotion.** Moving an artifact from a lower-trust class to a
+  higher one, after validation. Logged and reversible. See §12.4.
+- **Relevance score.** A number ∈ [0,1] attached to every event,
+  computed by the extractor, used by consumers to threshold what they
+  ingest. See §7.4.
+- **Safe Cognition Mode.** A recovery boot mode that runs only the
+  golden capability set and tells the AI it is in recovery. See §5.2.
+- **Semantic event.** A typed, schema-validated, signed message with
+  a relevance score and a provenance record. The unit of OS → AI
+  communication. See §7.3.
+- **Semantic Syscall Ring (`schedio`).** An io_uring extension that
+  delivers typed events instead of raw bytes. See §4.4.4.
+- **Speculative syscall prefetch (`sycache`).** A kernel cache for
+  the results of speculatively-issued syscalls, gated by manifest
+  declaration. See §4.4.5.
+- **TCB.** Trusted Computing Base. The smallest set of components
+  whose compromise compromises the whole system. Excludes model
+  weights, the inference engine, and generated code. See §2.5.
+- **Tensor handle (`tensorbuf`).** A DMA-buf fd with a shape/dtype
+  sidecar, used for zero-copy tool dispatch. See §4.4.2.
+- **Tier 0–3.** The four-tier development ladder: external-model
+  harness, Docker, VM, bare-metal Spark. See §17.1.
+- **Trust class.** A tag applied to inputs (user, retrieved doc,
+  capability output, system event) that gates what grammar branches
+  the model may emit. See §12.2.
+- **`vramctl`.** The kernel module that exposes VRAM as a first-class
+  managed resource with per-cgroup accounting and an opinionated
+  eviction policy. See §4.4.6.
+
+---
+
+*End of specification, Revision 0.5.*
