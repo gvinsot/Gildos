@@ -1,6 +1,6 @@
 [package]
 name        = "gildos-vramctl"
-description = "Gildos kernel primitive: vramctl (see SPECIFICATION.md §4.4)"
+description = "Gildos kernel primitive: vramctl (see SPECIFICATION.md §4.4.6)"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -14,3 +14,4 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+bitflags = { version = "2.6", default-features = false }

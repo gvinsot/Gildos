@@ -1,4 +1,8 @@
-[build]
-# Phase-1 default target. The CI matrix (§17) also builds for
-# aarch64-unknown-linux-gnu (R0 Spark, R1 Apple Silicon via cross).
-target = "x86_64-unknown-linux-gnu"
+# Build configuration for the Gildos workspace.
+#
+# We deliberately do NOT pin a default `target` here so the host toolchain
+# (x86_64 Linux, aarch64 Linux, aarch64 macOS) can build natively. CI
+# (see CONTRIBUTING.md §8) walks the §17 four-tier matrix explicitly.
+
+[net]
+git-fetch-with-cli = true
