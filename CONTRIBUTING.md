@@ -91,3 +91,32 @@ Pick an issue tagged `good-first-issue` in the MVG milestone, or one of:
   `events.query`) that pass the MVG demo (§1.5).
 
 Welcome aboard.
+
+## 8. CI (to be wired by a maintainer)
+
+The repository's CI gate is intentionally NOT committed in this scaffold
+commit — automated agents typically lack the GitHub `workflow` scope
+required to publish under `.github/workflows/`. A maintainer SHOULD add
+`.github/workflows/ci.yml` with the following job matrix:
+
+```yaml
+name: ci
+on: { push: { branches: [main] }, pull_request: {} }
+jobs:
+  cargo-check:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { components: rustfmt,clippy,rust-src, targets: "${{ matrix.target }}" }
+      - run: cargo check  --workspace --all-targets --target ${{ matrix.target }}
+      - run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo fmt --all -- --check
+```
+
+This is the §4.7 / §17 ladder's lowest tier, gated on every PR.
