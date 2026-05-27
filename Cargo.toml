@@ -1,0 +1,33 @@
+# Gildos workspace — Phase-1 scaffold.
+# Each member crate corresponds to one of the nine AI-native kernel
+# primitives in SPECIFICATION.md §4.4. In Phase 1 these compile as
+# regular Rust libraries with userspace-side type definitions and a
+# `#[cfg(kernel)]` path for the eventual Rust-for-Linux module form
+# (deferred until upstream Rust-for-Linux stabilises the required APIs).
+[workspace]
+resolver = "2"
+members = [
+    "gildos-kmod/dmload",
+    "gildos-kmod/vramctl",
+    "gildos-kmod/sched_cog",
+    "gildos-kmod/schedio",
+    "gildos-kmod/sycache",
+    "gildos-kmod/tensorbuf",
+    "gildos-kmod/kvfork",
+    "gildos-kmod/promptpin",
+    "gildos-kmod/cogcg",
+]
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2024"
+rust-version = "1.81"
+license      = "Apache-2.0 OR MIT"
+repository   = "https://github.com/gvinsot/Gildos"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs           = "warn"
+
+[workspace.lints.clippy]
+pedantic = "warn"

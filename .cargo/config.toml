@@ -1,0 +1,4 @@
+[build]
+# Phase-1 default target. The CI matrix (§17) also builds for
+# aarch64-unknown-linux-gnu (R0 Spark, R1 Apple Silicon via cross).
+target = "x86_64-unknown-linux-gnu"
